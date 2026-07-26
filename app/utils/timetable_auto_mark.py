@@ -300,8 +300,9 @@ def resolve_auto_mark_subjects(
     Rules:
     1. Load today's timetable for the student (currentDay, local timezone).
     2. Pick the slot active at the current local time (+ continuous following classes).
-    3. Every subject in a continuous chain must be enrolled. If any subject is
-       missing, block the entire chain so partial attendance cannot be recorded.
+    3. Only enrolled subjects are markable when the student has an enrollment list.
+       An unenrolled upcoming class is reported as a warning instead of blocking
+       the current enrolled class.
     """
     now = now or local_now()
     # Ensure comparisons always use app-local wall clock (IST / Asia/Colombo by default).
@@ -384,31 +385,29 @@ def resolve_auto_mark_subjects(
             seen_unenrolled.add(subject_key)
             unenrolled_subjects.append(subject)
 
+    markable_slots = (
+        [slot for slot in eligible if slot.subject_name.strip().lower() in enrolled_keys]
+        if enrolled_keys
+        else eligible
+    )
+    current_is_markable = bool(
+        current
+        and (
+            not enrolled_keys
+            or current.subject_name.strip().lower() in enrolled_keys
+        )
+    )
+    warning = None
     if unenrolled_subjects:
         warning = (
             f"Student is not enrolled for {', '.join(unenrolled_subjects)}. "
-            "Attendance stopped for the continuous class."
+            "Those classes are excluded from attendance."
         )
-        print(
-            f"[TIMETABLE] Attendance blocked: unenrolledSubjects={unenrolled_subjects}"
-        )
-        print("=" * 60)
-        return {
-            "dayOfWeek": day_canonical,
-            "currentTime": current_time,
-            "currentMinutes": now_minutes,
-            "timezone": APP_TIMEZONE,
-            "slots": display_slots,
-            "eligibleSlots": [],
-            "subjects": [],
-            "currentSlot": current,
-            "enrolledSubjects": enrolled,
-            "blocked": True,
-            "unenrolledSubjects": unenrolled_subjects,
-            "enrollmentWarning": warning,
-        }
+        print(f"[TIMETABLE] Unenrolled classes excluded: {unenrolled_subjects}")
 
-    subjects = [slot.subject_name for slot in eligible]
+    # The current class is marked immediately. Upcoming continuous classes are
+    # returned separately so an authorized user can confirm or untick them.
+    subjects = [current.subject_name] if current_is_markable else []
     print(f"[TIMETABLE] subjectsToMark={subjects}")
     print("=" * 60)
 
@@ -418,11 +417,13 @@ def resolve_auto_mark_subjects(
         "currentMinutes": now_minutes,
         "timezone": APP_TIMEZONE,
         "slots": display_slots if enrolled_keys else slots,
-        "eligibleSlots": eligible,
+        "eligibleSlots": markable_slots,
+        "continuousSlots": eligible,
+        "markableSlots": markable_slots,
         "subjects": subjects,
         "currentSlot": current,
         "enrolledSubjects": enrolled,
-        "blocked": False,
-        "unenrolledSubjects": [],
-        "enrollmentWarning": None,
+        "blocked": bool(current and not current_is_markable),
+        "unenrolledSubjects": unenrolled_subjects,
+        "enrollmentWarning": warning,
     }

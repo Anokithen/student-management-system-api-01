@@ -1,7 +1,7 @@
 from datetime import date
 
 from app.extensions import db
-from app.models import Attendance, Classroom, Student, User
+from app.models import Attendance, Classroom, Student, StudentPayment, User
 from app.utils import local_today, parse_attendance_date, parse_incoming_timestamp, utc_now
 from app.utils.alert_engine import calculate_attendance_status, process_late_alert
 
@@ -344,6 +344,9 @@ def create_attendance(data, user):
     student_id = data.get("studentId")
     classroom_id = data.get("classroomId")
     timestamp = data.get("timestamp")
+    selected_subjects_raw = data.get("selectedSubjects")
+    if selected_subjects_raw is None:
+        selected_subjects_raw = data.get("selected_subjects")
     marked_via = (data.get("markedVia") or data.get("marked_via") or "face").strip().lower()
     if marked_via not in ("face", "qr", "manual"):
         marked_via = "face"
@@ -396,6 +399,63 @@ def create_attendance(data, user):
     # Active timetable subjects only (already intersected with enrolled when set).
     subjects = list(plan.get("subjects") or [])
     eligible_slots = list(plan.get("eligibleSlots") or [])
+    continuous_slots = list(plan.get("continuousSlots") or eligible_slots)
+
+    # A first scan marks the current class automatically. If the caller is
+    # confirming the consecutive-class prompt, only the checked subjects are
+    # marked and the current class must remain selected.
+    if isinstance(selected_subjects_raw, list):
+        requested = []
+        seen = set()
+        for item in selected_subjects_raw:
+            subject = str(item or "").strip()
+            key = subject.lower()
+            if subject and key not in seen:
+                seen.add(key)
+                requested.append(subject)
+
+        markable_keys = {slot.subject_name.strip().lower() for slot in eligible_slots}
+        current_slot = plan.get("currentSlot")
+        current_key = current_slot.subject_name.strip().lower() if current_slot else None
+        requested_keys = {value.lower() for value in requested}
+        if current_key and current_key in markable_keys and current_key not in requested_keys:
+            return {
+                "success": False,
+                "errors": ["The current class must remain selected."],
+                "status": "SelectionRequired",
+            }, 400
+        invalid = [value for value in requested if value.lower() not in markable_keys]
+        if invalid:
+            return {
+                "success": False,
+                "errors": [f"Invalid timetable subject selection: {', '.join(invalid)}"],
+            }, 400
+        subjects = [
+            slot.subject_name
+            for slot in eligible_slots
+            if slot.subject_name.strip().lower() in requested_keys
+        ]
+
+    # Upcoming continuous classes are checked by default in the confirmation
+    # dialog; the user can untick them before the confirmation request.
+    default_selected_keys = (
+        {slot.subject_name.strip().lower() for slot in eligible_slots}
+        if not isinstance(selected_subjects_raw, list)
+        else {subject.lower() for subject in subjects}
+    )
+
+    payment_period = local_today().strftime("%Y-%m")
+    payment = StudentPayment.query.filter_by(
+        student_id=student.id,
+        billing_period=payment_period,
+    ).first()
+    payment_payload = payment.to_dict() if payment else {
+        "student_id": student.id,
+        "billing_period": payment_period,
+        "amount_due": None,
+        "payment_status": "Pending",
+        "paid_at": None,
+    }
 
     today_timetable = [
         {
@@ -424,6 +484,50 @@ def create_attendance(data, user):
 
     def _slot_time_range(slot):
         return f"{_format_clock(slot.start_time)} - {_format_clock(slot.end_time)}"
+
+    selected_keys = default_selected_keys
+    current_slot = plan.get("currentSlot")
+    current_key = current_slot.subject_name.strip().lower() if current_slot else None
+    enrolled_keys = {subject.lower() for subject in enrolled_subjects}
+    marked_option_rows = Attendance.query.filter_by(
+        student_id=student.id,
+        classroom_id=classroom.id,
+        date=attendance_date,
+    ).all()
+    marked_by_subject = {
+        (row.subject_name or "").strip().lower(): row
+        for row in marked_option_rows
+        if row.status in ("Present", "Late")
+    }
+    attendance_options = []
+    for slot in continuous_slots:
+        subject = slot.subject_name.strip()
+        subject_key = subject.lower()
+        is_enrolled = not enrolled_keys or subject_key in enrolled_keys
+        is_current = subject_key == current_key
+        attendance_options.append(
+            {
+                "slotId": slot.id,
+                "slot_id": slot.id,
+                "subjectName": subject,
+                "subject_name": subject,
+                "startTime": slot.start_time,
+                "start_time": slot.start_time,
+                "endTime": slot.end_time,
+                "end_time": slot.end_time,
+                "timeRange": _slot_time_range(slot),
+                "isCurrent": is_current,
+                "is_current": is_current,
+                "isUpcoming": not is_current,
+                "is_upcoming": not is_current,
+                "isEnrolled": is_enrolled,
+                "is_enrolled": is_enrolled,
+                "selected": subject_key in selected_keys,
+                "alreadyMarked": subject_key in marked_by_subject,
+                "already_marked": subject_key in marked_by_subject,
+                "disabled": not is_enrolled or is_current,
+            }
+        )
 
     def _scan_extras(
         *,
@@ -462,6 +566,14 @@ def create_attendance(data, user):
             "auto_marked_details": (present_details or []) + (already_details or []),
             "dayOfWeek": plan.get("dayOfWeek"),
             "currentTime": plan.get("currentTime"),
+            "monthlyPayment": payment_payload,
+            "monthly_payment": payment_payload,
+            "paymentStatus": payment_payload["payment_status"],
+            "payment_status": payment_payload["payment_status"],
+            "attendanceOptions": attendance_options,
+            "attendance_options": attendance_options,
+            "attendanceSelectionRequired": len(attendance_options) > 1,
+            "attendance_selection_required": len(attendance_options) > 1,
         }
 
     def _build_subject_details(subject_names, *, already=False):
@@ -894,6 +1006,9 @@ def scan_center_attendance(data, user):
             "timestamp": data.get("scanned_at"),
             "status": "Present",
             "markedVia": "qr",
+            "selected_subjects": data.get("selected_subjects")
+            if data.get("selected_subjects") is not None
+            else data.get("selectedSubjects"),
         },
         user,
     )
