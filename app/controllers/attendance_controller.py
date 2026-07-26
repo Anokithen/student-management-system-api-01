@@ -160,6 +160,40 @@ def _find_student_in_center(institution_id, scanned_id):
     return None
 
 
+def _subject_enrollment_error(student, subject_names):
+    """Return a warning when a student is not enrolled for an attendance subject."""
+    enrolled_keys = {
+        str(subject).strip().lower()
+        for subject in student.get_enrolled_subjects()
+        if str(subject).strip()
+    }
+    missing = []
+    seen = set()
+    for subject in subject_names:
+        label = str(subject or "").strip()
+        key = label.lower()
+        if label and key not in enrolled_keys and key not in seen:
+            seen.add(key)
+            missing.append(label)
+    if not missing:
+        return None
+
+    message = (
+        f"Student is not enrolled for {', '.join(missing)}. "
+        "Attendance stopped."
+    )
+    return {
+        "success": False,
+        "status": "NotEnrolled",
+        "error_code": "STUDENT_NOT_ENROLLED",
+        "not_enrolled": True,
+        "unenrolledSubjects": missing,
+        "unenrolled_subjects": missing,
+        "warning": message,
+        "errors": [message],
+    }
+
+
 def mark_attendance(data, user):
     raw_student_id = data.get("student_id")
     registration_no = (data.get("registration_no") or "").strip()
@@ -206,6 +240,14 @@ def mark_attendance(data, user):
     student = _find_student_in_center(classroom.institution_id, scanned_id)
     if not student:
         return {"errors": [f"Student not found for ID: {scanned_id}"]}, 404
+
+    # Subject-tagged requests must never create attendance for an un-enrolled
+    # student. Timetable requests also validate the whole continuous chain
+    # before reaching this function.
+    if subject_name:
+        enrollment_error = _subject_enrollment_error(student, [subject_name])
+        if enrollment_error:
+            return enrollment_error, 403
 
     attendance_date, date_error = parse_attendance_date(data.get("date"))
     if date_error:
@@ -412,6 +454,9 @@ def create_attendance(data, user):
             "present_now_details": present_details or [],
             "alreadyMarkedDetails": already_details or [],
             "already_marked_details": already_details or [],
+            "unenrolledSubjects": plan.get("unenrolledSubjects") or [],
+            "unenrolled_subjects": plan.get("unenrolledSubjects") or [],
+            "enrollmentWarning": plan.get("enrollmentWarning"),
             # Backward-compatible combined labels for older clients.
             "autoMarkedDetails": (present_details or []) + (already_details or []),
             "auto_marked_details": (present_details or []) + (already_details or []),
@@ -467,6 +512,21 @@ def create_attendance(data, user):
                     }
                 )
         return details
+
+    if plan.get("blocked"):
+        warning = plan.get("enrollmentWarning") or (
+            "Student is not enrolled for the current continuous class. Attendance stopped."
+        )
+        return {
+            "success": False,
+            "status": "NotEnrolled",
+            "error_code": "STUDENT_NOT_ENROLLED",
+            "not_enrolled": True,
+            "message": warning,
+            "warning": warning,
+            "errors": [warning],
+            **_scan_extras(marked=[]),
+        }, 403
 
     # No active timetable class right now → do NOT mark other enrolled subjects.
     if not subjects:
@@ -647,6 +707,11 @@ def save_manual_attendance(data, user):
             student = Student.query.get(student_id)
             if not student or student.institution_id != classroom.institution_id:
                 errors.append(f"Student {student_id} not found in this center")
+                continue
+
+            enrollment_error = _subject_enrollment_error(student, [subject_name])
+            if enrollment_error:
+                errors.append(enrollment_error["errors"][0])
                 continue
 
             record = Attendance.query.filter_by(

@@ -300,7 +300,8 @@ def resolve_auto_mark_subjects(
     Rules:
     1. Load today's timetable for the student (currentDay, local timezone).
     2. Pick the slot active at the current local time (+ continuous following classes).
-    3. If enrolledSubjects is set, keep only subjects the student is enrolled in.
+    3. Every subject in a continuous chain must be enrolled. If any subject is
+       missing, block the entire chain so partial attendance cannot be recorded.
     """
     now = now or local_now()
     # Ensure comparisons always use app-local wall clock (IST / Asia/Colombo by default).
@@ -344,8 +345,6 @@ def resolve_auto_mark_subjects(
     print(f"[TIMETABLE] enrolledSubjects={enrolled}")
 
     display_slots = slots
-    if enrolled_keys:
-        display_slots = [slot for slot in slots if slot.subject_name.lower() in enrolled_keys]
 
     if not slots:
         print("[TIMETABLE] No timetable rows for today/classroom — nothing to mark")
@@ -376,13 +375,38 @@ def resolve_auto_mark_subjects(
 
     eligible = collect_continuous_classes(slots, current)
 
-    if enrolled_keys:
-        before = [slot.subject_name for slot in eligible]
-        eligible = [slot for slot in eligible if slot.subject_name.lower() in enrolled_keys]
-        print(
-            f"[TIMETABLE] Enrollment filter before={before} "
-            f"after={[slot.subject_name for slot in eligible]}"
+    unenrolled_subjects = []
+    seen_unenrolled = set()
+    for slot in eligible:
+        subject = str(slot.subject_name or "").strip()
+        subject_key = subject.lower()
+        if subject and subject_key not in enrolled_keys and subject_key not in seen_unenrolled:
+            seen_unenrolled.add(subject_key)
+            unenrolled_subjects.append(subject)
+
+    if unenrolled_subjects:
+        warning = (
+            f"Student is not enrolled for {', '.join(unenrolled_subjects)}. "
+            "Attendance stopped for the continuous class."
         )
+        print(
+            f"[TIMETABLE] Attendance blocked: unenrolledSubjects={unenrolled_subjects}"
+        )
+        print("=" * 60)
+        return {
+            "dayOfWeek": day_canonical,
+            "currentTime": current_time,
+            "currentMinutes": now_minutes,
+            "timezone": APP_TIMEZONE,
+            "slots": display_slots,
+            "eligibleSlots": [],
+            "subjects": [],
+            "currentSlot": current,
+            "enrolledSubjects": enrolled,
+            "blocked": True,
+            "unenrolledSubjects": unenrolled_subjects,
+            "enrollmentWarning": warning,
+        }
 
     subjects = [slot.subject_name for slot in eligible]
     print(f"[TIMETABLE] subjectsToMark={subjects}")
@@ -398,4 +422,7 @@ def resolve_auto_mark_subjects(
         "subjects": subjects,
         "currentSlot": current,
         "enrolledSubjects": enrolled,
+        "blocked": False,
+        "unenrolledSubjects": [],
+        "enrollmentWarning": None,
     }
